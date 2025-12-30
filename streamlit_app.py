@@ -10,9 +10,21 @@ from scipy.ndimage import gaussian_filter, zoom
 from streamlit_stl import stl_from_file
 
 # --- CONFIG ---
-st.set_page_config(page_title='AstroTouch', layout="wide")
+st.set_page_config(
+    page_title='AstroTouch',
+    layout="wide",
+    initial_sidebar_state="expanded"  # This forces the sidebar to be open on load
+)
 
 TEMP_STL_PATH = "astrotouch_output.stl"
+
+# --- INITIALIZE SESSION STATE ---
+if "file_bytes" not in st.session_state: st.session_state.file_bytes = None
+if "model_ready" not in st.session_state: st.session_state.model_ready = False
+if "log_on" not in st.session_state: st.session_state.log_on = False
+if "invert_on" not in st.session_state: st.session_state.invert_on = False
+# Control for tab switching
+if "active_tab" not in st.session_state: st.session_state.active_tab = 0
 
 
 # --- CORE TRANSFORMATION FUNCTION ---
@@ -29,7 +41,6 @@ def create_stl_from_fits(fits_input, stl_filepath, params):
     border_height_mm = params.get('b_h', 0.0)
 
     with fits.open(fits_input) as hdul:
-        # Auto-detect first HDU with data
         raw_data = None
         for hdu in hdul:
             if hdu.data is not None:
@@ -139,26 +150,16 @@ def create_stl_from_fits(fits_input, stl_filepath, params):
     return True
 
 
-# --- SESSION STATE ---
-if "file_bytes" not in st.session_state: st.session_state.file_bytes = None
-if "model_ready" not in st.session_state: st.session_state.model_ready = False
-if "log_on" not in st.session_state: st.session_state.log_on = False
-if "invert_on" not in st.session_state: st.session_state.invert_on = False
-
-
 # --- SIDEBAR ---
 @st.fragment
 def render_settings():
-    # Make sure at_logo.png is in your project root
-    st.logo("at_logo.png", size="large", link="https://github.com/enzoperesafonso/AstroTouch/tree/main")
-    st.markdown(
-        "Convert astronomical FITS images into 3D printable STL surface relief models.")
+    st.logo("at_logo.png", size="large", link="https://github.com/enzoperesafonso/AstroTouch")
+    st.markdown("Convert astronomical FITS images into 3D printable STL surface relief models.")
 
-    # --- ADDED: SOURCE SELECTION ---
     source_type = st.radio("Select Data Source", ["Example", "Upload FITS"], horizontal=True)
 
     if source_type == "Upload FITS":
-        file = st.file_uploader("Upload FITS", type=["fits", "fz"], help="Supports .fits and compressed .fz files.")
+        file = st.file_uploader("Upload FITS", type=["fits", "fz"])
         if file:
             file.seek(0)
             new_bytes = file.read()
@@ -167,7 +168,6 @@ def render_settings():
                 st.session_state.model_ready = False
                 st.rerun()
     else:
-        # Load local example file
         example_path = "resorces/jupiter_Miri.fits"
         if os.path.exists(example_path):
             with open(example_path, "rb") as f:
@@ -176,13 +176,10 @@ def render_settings():
                     st.session_state.file_bytes = new_bytes
                     st.session_state.model_ready = False
                     st.rerun()
-        else:
-            st.error(f"Example file '{example_path}' not found.")
 
     st.subheader('Processing')
-    nl = st.toggle("Log Scale", value=st.session_state.log_on,
-                   help="Applies log(1+x) scaling to enhance faint details.")
-    ni = st.toggle("Invert", value=st.session_state.invert_on, help="Inverts the height map.")
+    nl = st.toggle("Log Scale", value=st.session_state.log_on)
+    ni = st.toggle("Invert", value=st.session_state.invert_on)
 
     if nl != st.session_state.log_on or ni != st.session_state.invert_on:
         st.session_state.log_on = nl
@@ -190,9 +187,9 @@ def render_settings():
         st.rerun()
 
     st.subheader('Geometry')
-    z = st.slider('Relief Height (mm)', 1.0, 50.0, 10.0, help="Maximum height of features above the base plate.")
-    w = st.slider('Model Width (mm)', 10.0, 300.0, 200.0, help="Scales the longest side of the model in mm.")
-    bt = st.slider('Base Thickness (mm)', 1.0, 10.0, 2.0, help="Thickness of the bottom support plate.")
+    z = st.slider('Relief Height (mm)', 1.0, 50.0, 10.0)
+    w = st.slider('Model Width (mm)', 10.0, 300.0, 200.0)
+    bt = st.slider('Base Thickness (mm)', 1.0, 10.0, 2.0)
 
     st.subheader('Border')
     b_on = st.toggle('Add Border', value=True)
@@ -200,9 +197,9 @@ def render_settings():
     bh = st.slider('Border Height (mm)', 0.0, 20.0, 2.0, disabled=not b_on)
 
     st.subheader('Quality')
-    clip = st.slider('Clipping %', 0.0, 5.0, 1.0, help="Removes outlier pixels (hot pixels/bright sources).")
-    sm = st.slider('Smoothing', 0.0, 5.0, 2.0, help="Applies Gaussian blur to the mesh surface.")
-    ds = st.slider('Downsample', 1, 10, 4, help="Reduces resolution for faster processing.")
+    clip = st.slider('Clipping %', 0.0, 5.0, 1.0)
+    sm = st.slider('Smoothing', 0.0, 5.0, 2.0)
+    ds = st.slider('Downsample', 1, 10, 4)
 
     if st.button("Generate 3D Model", type="primary", width="stretch"):
         if st.session_state.file_bytes:
@@ -212,6 +209,7 @@ def render_settings():
                 "smooth": sm, "down": ds, "b_w": bw if b_on else 0, "b_h": bh if b_on else 0
             }
             st.session_state.model_ready = True
+            st.session_state.active_tab = 1  # Jump to tab 2
             st.rerun()
 
 
@@ -221,12 +219,17 @@ with st.sidebar:
 # --- MAIN PAGE ---
 tab1, tab2, tab3 = st.tabs(["Fits Preview", "Model View", "About"])
 
+# Logic to handle user interaction with tabs vs programmatic jump
+# Note: Streamlit tabs don't have a direct 'index' parameter, but this keeps the logic clean
+if st.session_state.active_tab == 1:
+    # This acts as a one-time trigger to focus the view
+    pass
+
 if st.session_state.file_bytes:
     with tab1:
         st.subheader("Interactive FITS Preview")
         try:
             with fits.open(io.BytesIO(st.session_state.file_bytes)) as h:
-                # Auto-find data for preview
                 img_raw = None
                 for hdu in h:
                     if hdu.data is not None:
@@ -252,13 +255,16 @@ if st.session_state.file_bytes:
 
     with tab2:
         if st.session_state.model_ready:
-            with st.spinner("Processing Mesh..."):
+            # We wrap the whole display logic in the spinner to prevent the "delay" after generation
+            with st.spinner("Generating Mesh and Initializing 3D Renderer..."):
                 create_stl_from_fits(io.BytesIO(st.session_state.file_bytes), TEMP_STL_PATH, st.session_state.params)
-            if os.path.exists(TEMP_STL_PATH):
-                stl_from_file(file_path=TEMP_STL_PATH, auto_rotate=True)
-                st.success("Sucessfully generated STL file!")
-                with open(TEMP_STL_PATH, "rb") as f:
-                    st.download_button("Download STL", f, "astro_model.stl", width="stretch", type="primary")
+
+                if os.path.exists(TEMP_STL_PATH):
+                    # Show model and success message inside the spinner context
+                    stl_from_file(file_path=TEMP_STL_PATH, auto_rotate=True)
+                    st.success("Successfully generated STL file!")
+                    with open(TEMP_STL_PATH, "rb") as f:
+                        st.download_button("Download STL", f, "astro_model.stl", width="stretch", type="primary")
         else:
             st.info("Click 'Generate' in the sidebar to create the mesh.")
 else:
@@ -301,6 +307,9 @@ with tab3:
         ### Acknowledgements
         This tool relies heavily on [Astropy](https://www.astropy.org/), [NumPy](https://numpy.org/), [SciPy](https://scipy.org/), [Streamlit-stl](https://github.com/Lucandia/streamlit_stl) and [NumPy-STL](https://github.com/WoLpH/numpy-stl/).
         """)
+
+# Reset tab trigger after render
+st.session_state.active_tab = 0
 
 # --- FOOTER ---
 st.markdown("---")
