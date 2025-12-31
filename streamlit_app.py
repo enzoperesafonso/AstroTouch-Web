@@ -13,7 +13,7 @@ from streamlit_stl import stl_from_file
 st.set_page_config(
     page_title='AstroTouch',
     layout="wide",
-    initial_sidebar_state="expanded"  # This forces the sidebar to be open on load
+    initial_sidebar_state="expanded"
 )
 
 TEMP_STL_PATH = "astrotouch_output.stl"
@@ -23,7 +23,6 @@ if "file_bytes" not in st.session_state: st.session_state.file_bytes = None
 if "model_ready" not in st.session_state: st.session_state.model_ready = False
 if "log_on" not in st.session_state: st.session_state.log_on = False
 if "invert_on" not in st.session_state: st.session_state.invert_on = False
-# Control for tab switching
 if "active_tab" not in st.session_state: st.session_state.active_tab = 0
 
 
@@ -154,7 +153,7 @@ def create_stl_from_fits(fits_input, stl_filepath, params):
 @st.fragment
 def render_settings():
     st.logo("at_logo.png", size="large", link="https://github.com/enzoperesafonso/AstroTouch")
-    st.markdown("Convert astronomical FITS images into 3D printable STL surface relief models.")
+    st.markdown("Convert astronomical FITS images into 3D printable models.")
 
     source_type = st.radio("Select Data Source", ["Example", "Upload FITS"], horizontal=True)
 
@@ -209,7 +208,7 @@ def render_settings():
                 "smooth": sm, "down": ds, "b_w": bw if b_on else 0, "b_h": bh if b_on else 0
             }
             st.session_state.model_ready = True
-            st.session_state.active_tab = 1  # Jump to tab 2
+            st.session_state.active_tab = 1
             st.rerun()
 
 
@@ -219,59 +218,57 @@ with st.sidebar:
 # --- MAIN PAGE ---
 tab1, tab2, tab3 = st.tabs(["Fits Preview", "Model View", "About"])
 
-# Logic to handle user interaction with tabs vs programmatic jump
-# Note: Streamlit tabs don't have a direct 'index' parameter, but this keeps the logic clean
-if st.session_state.active_tab == 1:
-    # This acts as a one-time trigger to focus the view
-    pass
-
 if st.session_state.file_bytes:
     with tab1:
         st.subheader("Interactive FITS Preview")
-        try:
-            with fits.open(io.BytesIO(st.session_state.file_bytes)) as h:
-                img_raw = None
-                for hdu in h:
-                    if hdu.data is not None:
-                        img_raw = hdu.data
-                        break
-                if img_raw.ndim > 2: img_raw = img_raw[0]
-                img = np.nan_to_num(img_raw)
+        with st.spinner("Analyzing FITS Data..."):
+            try:
+                with fits.open(io.BytesIO(st.session_state.file_bytes)) as h:
+                    img_raw = None
+                    for hdu in h:
+                        if hdu.data is not None:
+                            img_raw = hdu.data
+                            break
+                    if img_raw.ndim > 2: img_raw = img_raw[0]
+                    img = np.nan_to_num(img_raw)
 
-            p_low, p_high = np.percentile(img, [1, 99])
-            prev = np.clip(img, p_low, p_high)
-            stride = max(1, prev.shape[0] // 1200, prev.shape[1] // 1200)
-            prev = prev[::stride, ::stride].copy()
+                p_low, p_high = np.percentile(img, [1, 99])
+                prev = np.clip(img, p_low, p_high)
+                stride = max(1, prev.shape[0] // 1200, prev.shape[1] // 1200)
+                prev = prev[::stride, ::stride].copy()
 
-            if st.session_state.invert_on: prev = np.max(prev) - prev
-            if st.session_state.log_on: prev = np.log10(prev - np.min(prev) + 1)
+                if st.session_state.invert_on: prev = np.max(prev) - prev
+                if st.session_state.log_on: prev = np.log10(prev - np.min(prev) + 1)
 
-            fig = px.imshow(prev, origin='lower',
-                            color_continuous_scale="viridis_r" if st.session_state.invert_on else "viridis")
-            fig.update_layout(dragmode='pan', margin=dict(l=0, r=0, b=0, t=0), xaxis_visible=False, yaxis_visible=False)
-            st.plotly_chart(fig, width="stretch", config={'scrollZoom': True})
-        except Exception as e:
-            st.error(f"Visualization error: {e}")
+                fig = px.imshow(prev, origin='lower',
+                                color_continuous_scale="viridis_r" if st.session_state.invert_on else "viridis")
+                fig.update_layout(dragmode='pan', margin=dict(l=0, r=0, b=0, t=0), xaxis_visible=False,
+                                  yaxis_visible=False)
+                st.plotly_chart(fig, width="stretch", config={'scrollZoom': True})
+            except Exception as e:
+                st.error(f"Visualization error: {e}")
 
     with tab2:
         if st.session_state.model_ready:
-            # We wrap the whole display logic in the spinner to prevent the "delay" after generation
-            with st.spinner("Generating Mesh and Initializing 3D Renderer..."):
+            # The spinner now covers the entire setup process
+            with st.spinner("Reconstructing Scientific Mesh and Preparing 3D Canvas..."):
                 create_stl_from_fits(io.BytesIO(st.session_state.file_bytes), TEMP_STL_PATH, st.session_state.params)
 
                 if os.path.exists(TEMP_STL_PATH):
-                    # Show model and success message inside the spinner context
-                    stl_from_file(file_path=TEMP_STL_PATH, auto_rotate=True)
-                    st.success("Successfully generated STL file!")
+                    # We render the viewer component while STILL inside the spinner
+                    model_container = st.empty()
+                    with model_container:
+                        stl_from_file(file_path=TEMP_STL_PATH, auto_rotate=True)
+
+                    # Force a tiny sleep to allow the browser thread to start the WebGL draw
+                    # before the spinner 'erases' itself.
+                    time.sleep(1.0)
+
+                    st.success("Successfully generated model!")
                     with open(TEMP_STL_PATH, "rb") as f:
-                        st.download_button("Download STL", f, "astro_model.stl", width="stretch", type="primary")
+                        st.download_button("Download STL", f, "astro_touch_model.stl", width="stretch", type="primary")
         else:
             st.info("Click 'Generate' in the sidebar to create the mesh.")
-else:
-    with tab1:
-        st.info("Upload a file or select 'Example' in the sidebar to begin.")
-    with tab2:
-        st.info("Upload a file and click 'Generate' to see the model.")
 
 with tab3:
     st.title("About AstroTouch")
@@ -308,9 +305,6 @@ with tab3:
         This tool relies heavily on [Astropy](https://www.astropy.org/), [NumPy](https://numpy.org/), [SciPy](https://scipy.org/), [Streamlit-stl](https://github.com/Lucandia/streamlit_stl) and [NumPy-STL](https://github.com/WoLpH/numpy-stl/).
         """)
 
-# Reset tab trigger after render
 st.session_state.active_tab = 0
-
-# --- FOOTER ---
 st.markdown("---")
 st.caption("🔭 **AstroTouch v1.0** | Created by **Enzo Peres Afonso**")
