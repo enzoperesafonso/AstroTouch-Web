@@ -262,7 +262,7 @@ if st.session_state.file_bytes:
 
                     # Force a tiny sleep to allow the browser thread to start the WebGL draw
                     # before the spinner 'erases' itself.
-                    time.sleep(1.0)
+                    time.sleep(5.0)
 
                     st.success("Successfully generated model!")
                     with open(TEMP_STL_PATH, "rb") as f:
