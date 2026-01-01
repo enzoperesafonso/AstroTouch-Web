@@ -6,5 +6,3 @@ textColor = "#fafafa"
 font = "sans serif"
 base = "dark"
 
-[server]
-maxUploadSize = 1000  # Set the limit in MB (e.g., 1000 for 1GB)
