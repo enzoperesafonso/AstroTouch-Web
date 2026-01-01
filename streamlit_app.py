@@ -299,7 +299,7 @@ with tab3:
 
         ### Open Source & Contribution
         AstroTouch is an ongoing effort to bridge the gap between science and accessibility. 
-        To see the code behind this tool, report issues, or contribute to its development, please visit the **[GitHub repository](https://github.com/enzoperesafonso/AstroTouch/tree/main)**.
+        To see the code behind this tool, report issues, or contribute to its development, please visit the **[GitHub repository](https://github.com/enzoperesafonso/AstroTouch-Web)**.
 
         ### Supporting Accessibility
         If you find this software useful and would like to support the cause of accessibility in South Africa, please consider making a small donation to the **South African Guide Dogs Association for the Blind**. 

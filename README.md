@@ -36,7 +36,7 @@ Follow these instructions to set up and run a local instance of AstroTouch.
 
 1.  **Clone the repository:**
     ```bash
-    git clone https://github.com/enzoperesafonso/AstroTouch.git
+    git clone https://github.com/enzoperesafonso/AstroTouch-Web
     cd AstroTouch
     ```
 
