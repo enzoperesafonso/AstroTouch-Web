@@ -10,8 +10,7 @@
 
 **AstroTouch** is an open-source web application designed to make astronomical data accessible to everyone, particularly the visually impaired community. It generates tactile relief maps from scientific FITS files that can be printed on any consumer-grade 3D printer.
 
-![AstroTouch Screenshot](https://i.imgur.com/your_screenshot.png)  
-*(Note: You can replace the link above with a real screenshot of your application)*
+![AstroTouch Screenshot](resorces/screenshot.png)
 
 ## Key Features
 
