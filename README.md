@@ -83,16 +83,6 @@ AstroTouch processes scientific FITS data through a specific mathematical pipeli
 2.  **Logarithmic Scaling**: Astronomical objects often have an extreme dynamic range. A logarithmic transform ($Z_{new} = \log(1+Z)$) is applied to ensure that faint, subtle structures become tactilely perceptible.
 3.  **Mesh Generation**: The processed 2D array is converted into a 3D manifold. The tool connects thousands of triangles to form a watertight STL surface, which is the standard format for 3D printing.
 
-## Acknowledgements & Support
-
-This tool is built on the shoulders of giants. It relies heavily on the following open-source libraries:
-- [Astropy](https://www.astropy.org/)
-- [NumPy](https://numpy.org/) & [SciPy](https://scipy.org/)
-- [Streamlit](https://streamlit.io/)
-- [NumPy-STL](https://github.com/WoLpH/numpy-stl)
-- [Streamlit-STL](https://github.com/Lucandia/streamlit_stl)
-
-If you find this software useful, please consider supporting the cause of accessibility by donating to the **[South African Guide Dogs Association for the Blind](https://guidedog.org.za/donate/)**.
 
 ---
 *Created by Enzo Peres Afonso*
