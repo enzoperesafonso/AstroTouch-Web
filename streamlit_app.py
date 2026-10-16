@@ -1,12 +1,15 @@
-import time
+import hashlib
 import io
 import os
+import tempfile
+
 import numpy as np
-import streamlit as st
 import plotly.express as px
+import streamlit as st
 from astropy.io import fits
+from scipy.ndimage import gaussian_filter
 from stl import mesh
-from scipy.ndimage import gaussian_filter, zoom
+
 from streamlit_stl import stl_from_file
 
 # --- CONFIG ---
@@ -17,12 +20,19 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-TEMP_STL_PATH = "astrotouch_output.stl"
+EXAMPLE_PATH = "resorces/jupiter_Miri.fits"
+MAX_GRID_POINTS = 2_000_000   # guard against meshes that exhaust server memory
+PREVIEW_MAX_SIDE = 1000       # longest side of the 2D preview, in pixels
+
+DEFAULT_PARAMS = {
+    "z": 10.0, "w": 200.0, "base": 2.0, "log": False,
+    "invert": False, "clip": 1.0, "smooth": 2.0, "down": 4,
+    "b_w": 5.0, "b_h": 2.0,
+}
 
 # --- CUSTOM CSS ---
 st.markdown("""
     <style>
-    div[st-decorator="true"] { display: none; }
     .stButton button { width: 100%; border-radius: 5px; }
     .stTabs [data-baseweb="tab-list"] { gap: 24px; }
     .stTabs [data-baseweb="tab"] { height: 50px; white-space: pre-wrap; font-weight: 600; }
@@ -30,143 +40,181 @@ st.markdown("""
     """, unsafe_allow_html=True)
 
 # --- INITIALIZE SESSION STATE ---
-if "file_bytes" not in st.session_state: st.session_state.file_bytes = None
-if "model_ready" not in st.session_state: st.session_state.model_ready = False
-if "params" not in st.session_state:
-    st.session_state.params = {
-        "z": 10.0, "w": 200.0, "base": 2.0, "log": False,
-        "invert": False, "clip": 1.0, "smooth": 2.0, "down": 4,
-        "b_w": 5.0, "b_h": 2.0
-    }
+st.session_state.setdefault("file_bytes", None)
+st.session_state.setdefault("file_id", None)
+st.session_state.setdefault("stl_path", None)
+st.session_state.setdefault("stl_size", 0)
+
+
+# --- FITS HELPERS ---
+def find_image(hdul):
+    """Return the first HDU holding a numeric array with at least two dimensions as a 2D float32 array."""
+    for hdu in hdul:
+        data = getattr(hdu, "data", None)
+        if not isinstance(data, np.ndarray) or data.dtype.names is not None:
+            continue  # empty HDU or binary/ASCII table
+        if data.ndim < 2 or data.dtype.kind not in "iuf":
+            continue
+        data = np.asarray(data, dtype=np.float32)
+        while data.ndim > 2:  # data cubes: use the first plane
+            data = data[0]
+        if data.shape[0] > 1 and data.shape[1] > 1:
+            return data
+    raise ValueError("No 2D image data found in this FITS file.")
+
+
+def clean_image(img):
+    """Replace NaN/Inf with the minimum finite value."""
+    finite = np.isfinite(img)
+    if not finite.any():
+        raise ValueError("The FITS image contains no finite pixel values.")
+    if finite.all():
+        return img
+    out = img.copy()
+    out[~finite] = img[finite].min()
+    return out
+
+
+@st.cache_data(show_spinner=False, max_entries=3)
+def load_fits(file_bytes):
+    with fits.open(io.BytesIO(file_bytes), memmap=False) as hdul:
+        return clean_image(find_image(hdul))
+
+
+def block_downsample(img, factor):
+    """Downsample by averaging factor x factor blocks (edges that do not fit are trimmed)."""
+    if factor <= 1:
+        return img
+    ny, nx = (img.shape[0] // factor) * factor, (img.shape[1] // factor) * factor
+    if ny == 0 or nx == 0:
+        raise ValueError("Downsample factor is larger than the image.")
+    blocks = img[:ny, :nx].reshape(ny // factor, factor, nx // factor, factor)
+    return blocks.mean(axis=(1, 3), dtype=np.float32)
+
+
+def normalize_image(img, clip, log_scale, invert):
+    """Clip, optionally log-scale and invert, then normalise to 0..1. Shared by preview and mesh."""
+    img = img.astype(np.float32, copy=True)
+    if clip > 0:
+        lo, hi = np.percentile(img, [clip, 100 - clip])
+        img = np.clip(img, lo, hi)
+    if log_scale:
+        img -= img.min()
+        img = np.log1p(img)
+    if invert:
+        img = img.max() - img
+    lo, hi = float(img.min()), float(img.max())
+    return (img - lo) / (hi - lo) if hi > lo else np.zeros_like(img)
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def make_preview(file_bytes, clip, log_scale, invert):
+    img = load_fits(file_bytes)
+    step = max(1, int(np.ceil(max(img.shape) / PREVIEW_MAX_SIDE)))
+    return normalize_image(block_downsample(img, step), clip, log_scale, invert)
+
+
+def grid_shape(img_shape, params):
+    """Size of the final vertex grid (after downsampling and border)."""
+    d = params["down"]
+    ny, nx = img_shape[0] // d, img_shape[1] // d
+    if params["b_w"] > 0 and nx > 0 and ny > 0:
+        bp = int(round(params["b_w"] / (params["w"] / max(nx, ny))))
+        ny, nx = ny + 2 * bp, nx + 2 * bp
+    return ny, nx
 
 
 # --- CORE TRANSFORMATION FUNCTION ---
-def create_stl_from_fits(fits_input, stl_filepath, params):
-    longest_side_mm = params.get('w', 100.0)
-    max_height_mm = params.get('z', 10.0)
-    base_thickness_mm = params.get('base', 2.0)
-    invert = params.get('invert', False)
-    log_scale = params.get('log', True)
-    clip_percentile = params.get('clip', 1.0)
-    smoothing_sigma = params.get('smooth', 0.5)
-    downsample_factor = params.get('down', 1)
-    border_width_mm = params.get('b_w', 0.0)
-    border_height_mm = params.get('b_h', 0.0)
+def build_faces(ny, nx):
+    """Triangles for a watertight slab: top surface, bottom surface and four side walls.
+    Vertices [0, n) are the top grid; [n, 2n) are the matching bottom grid."""
+    n = nx * ny
+    idx = np.arange(n, dtype=np.uint32).reshape(ny, nx)
+    v00, v10 = idx[:-1, :-1].ravel(), idx[:-1, 1:].ravel()
+    v01, v11 = idx[1:, :-1].ravel(), idx[1:, 1:].ravel()
+    o = np.uint32(n)
 
-    with fits.open(fits_input) as hdul:
-        raw_data = None
-        for hdu in hdul:
-            if hdu.data is not None:
-                raw_data = hdu.data
-                break
-        if raw_data is None:
-            raise ValueError("No valid image data found in FITS extensions.")
-        image_data = raw_data.astype(np.float32)
+    parts = [
+        np.stack([v00, v10, v01], axis=1),
+        np.stack([v10, v11, v01], axis=1),
+        np.stack([o + v00, o + v01, o + v10], axis=1),
+        np.stack([o + v10, o + v01, o + v11], axis=1),
+    ]
 
-    if downsample_factor > 1:
-        image_data = zoom(image_data, 1 / downsample_factor, order=1)
+    def wall(edge, flip):
+        t0, t1 = edge[:-1], edge[1:]
+        b0, b1 = o + t0, o + t1
+        if flip:
+            return [np.stack([t0, b1, b0], axis=1), np.stack([t0, t1, b1], axis=1)]
+        return [np.stack([t0, b0, b1], axis=1), np.stack([t0, b1, t1], axis=1)]
 
-    image_data = np.nan_to_num(image_data, nan=np.nanmin(image_data) if np.any(np.isfinite(image_data)) else 0)
+    parts += wall(idx[0, :], False)    # front (y = 0)
+    parts += wall(idx[-1, :], True)    # back
+    parts += wall(idx[:, 0], True)     # left
+    parts += wall(idx[:, -1], False)   # right
+    return np.concatenate(parts, axis=0)
 
-    if clip_percentile > 0:
-        min_p = np.percentile(image_data, clip_percentile)
-        max_p = np.percentile(image_data, 100 - clip_percentile)
-        image_data = np.clip(image_data, min_p, max_p)
 
-    if log_scale:
-        image_data -= np.min(image_data)
-        image_data = np.log1p(image_data)
-    if invert:
-        image_data = np.max(image_data) - image_data
+def create_stl_from_fits(file_bytes, stl_filepath, params):
+    img = block_downsample(load_fits(file_bytes), params["down"])
+    if img.shape[0] < 2 or img.shape[1] < 2:
+        raise ValueError("Image is too small after downsampling; use a lower downsample factor.")
+    ny, nx = grid_shape(load_fits(file_bytes).shape, params)
+    if nx * ny > MAX_GRID_POINTS:
+        raise ValueError(
+            f"The model would have {nx * ny:,} grid points (limit {MAX_GRID_POINTS:,}). "
+            "Increase the downsample factor.")
 
-    min_val, max_val = np.min(image_data), np.max(image_data)
-    denom = (max_val - min_val) if (max_val - min_val) != 0 else 1
-    z_data = base_thickness_mm + ((image_data - min_val) / denom) * max_height_mm
+    z_data = params["base"] + normalize_image(
+        img, params["clip"], params["log"], params["invert"]) * params["z"]
 
-    if smoothing_sigma > 0:
-        z_data = gaussian_filter(z_data, sigma=smoothing_sigma)
+    if params["smooth"] > 0:
+        z_data = gaussian_filter(z_data, sigma=params["smooth"])
 
     ny, nx = z_data.shape
-    scale_factor = longest_side_mm / max(nx, ny)
+    scale_factor = params["w"] / max(nx, ny)
 
-    if border_width_mm > 0:
-        bp = int(round(border_width_mm / scale_factor))
-        z_bordered = np.full((ny + 2 * bp, nx + 2 * bp), base_thickness_mm + border_height_mm)
-        z_bordered[bp:bp + ny, bp:bp + nx] = z_data
-        z_data = z_bordered
-        ny, nx = z_data.shape
+    if params["b_w"] > 0:
+        bp = int(round(params["b_w"] / scale_factor))
+        if bp > 0:
+            bordered = np.full((ny + 2 * bp, nx + 2 * bp), params["base"] + params["b_h"], dtype=np.float32)
+            bordered[bp:bp + ny, bp:bp + nx] = z_data
+            z_data = bordered
+            ny, nx = z_data.shape
 
-    x = np.arange(nx) * scale_factor
-    y = np.arange(ny) * scale_factor
-    xx, yy = np.meshgrid(x, y)
+    xx, yy = np.meshgrid(np.arange(nx) * scale_factor, np.arange(ny) * scale_factor)
+    n = nx * ny
+    vertices = np.zeros((n * 2, 3), dtype=np.float32)
+    vertices[:n, 0] = xx.ravel()
+    vertices[:n, 1] = yy.ravel()
+    vertices[:n, 2] = z_data.ravel()
+    vertices[n:, :2] = vertices[:n, :2]
 
-    num_vertices = nx * ny
-    vertices = np.zeros((num_vertices * 2, 3), dtype=np.float32)
-    vertices[:num_vertices, 0] = xx.flatten()
-    vertices[:num_vertices, 1] = yy.flatten()
-    vertices[:num_vertices, 2] = z_data.flatten()
-    vertices[num_vertices:, 0:2] = vertices[:num_vertices, 0:2]
-    vertices[num_vertices:, 2] = 0.0
-
-    num_faces_per_surface = 2 * (nx - 1) * (ny - 1)
-    num_side_faces = 2 * (nx - 1) + 2 * (ny - 1)
-    total_faces = (num_faces_per_surface * 2) + (num_side_faces * 2)
-    faces = np.zeros((total_faces, 3), dtype=np.uint32)
-
-    face_idx = 0
-    base_offset = num_vertices
-
-    # Generate Surfaces
-    for j in range(ny - 1):
-        for i in range(nx - 1):
-            v00, v10 = j * nx + i, j * nx + (i + 1)
-            v01, v11 = (j + 1) * nx + i, (j + 1) * nx + (i + 1)
-            faces[face_idx] = [v00, v10, v01];
-            face_idx += 1
-            faces[face_idx] = [v10, v11, v01];
-            face_idx += 1
-            faces[face_idx] = [base_offset + v00, base_offset + v01, base_offset + v10];
-            face_idx += 1
-            faces[face_idx] = [base_offset + v10, base_offset + v01, base_offset + v11];
-            face_idx += 1
-
-    # Generate Side Walls
-    for i in range(nx - 1):
-        # Top edge
-        v_t0, v_t1 = i, i + 1
-        v_b0, v_b1 = base_offset + i, base_offset + i + 1
-        faces[face_idx] = [v_t0, v_b0, v_b1];
-        face_idx += 1
-        faces[face_idx] = [v_t0, v_b1, v_t1];
-        face_idx += 1
-        # Bottom edge
-        v_t0, v_t1 = (ny - 1) * nx + i, (ny - 1) * nx + i + 1
-        v_b0, v_b1 = base_offset + (ny - 1) * nx + i, base_offset + (ny - 1) * nx + i + 1
-        faces[face_idx] = [v_t0, v_b1, v_b0];
-        face_idx += 1
-        faces[face_idx] = [v_t0, v_t1, v_b1];
-        face_idx += 1
-
-    for j in range(ny - 1):
-        # Left edge
-        v_t0, v_t1 = j * nx, (j + 1) * nx
-        v_b0, v_b1 = base_offset + j * nx, base_offset + (j + 1) * nx
-        faces[face_idx] = [v_t0, v_b1, v_b0];
-        face_idx += 1
-        faces[face_idx] = [v_t0, v_t1, v_b1];
-        face_idx += 1
-        # Right edge
-        v_t0, v_t1 = j * nx + (nx - 1), (j + 1) * nx + (nx - 1)
-        v_b0, v_b1 = base_offset + j * nx + (nx - 1), base_offset + (j + 1) * nx + (nx - 1)
-        faces[face_idx] = [v_t0, v_b0, v_b1];
-        face_idx += 1
-        faces[face_idx] = [v_t0, v_b1, v_t1];
-        face_idx += 1
-
+    faces = build_faces(ny, nx)
     out_mesh = mesh.Mesh(np.zeros(faces.shape[0], dtype=mesh.Mesh.dtype))
     out_mesh.vectors = vertices[faces]
+    out_mesh.update_normals()
     out_mesh.save(stl_filepath)
-    return True
+
+
+def set_source(data, name):
+    """Store the active FITS file; drop any model built from a previous file."""
+    file_id = hashlib.md5(data).hexdigest() if data else None
+    if file_id != st.session_state.file_id:
+        st.session_state.file_id = file_id
+        st.session_state.file_bytes = data
+        st.session_state.file_name = name
+        clear_model()
+
+
+def clear_model():
+    path = st.session_state.stl_path
+    if path and os.path.exists(path):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+    st.session_state.stl_path = None
 
 
 # --- SIDEBAR ---
@@ -177,104 +225,113 @@ with st.sidebar:
     source_type = st.radio("Select Data Source", ["Example", "Upload FITS"], horizontal=True)
 
     if source_type == "Upload FITS":
-        file = st.file_uploader("Upload FITS", type=["fits", "fz"])
+        file = st.file_uploader("Upload FITS", type=["fits", "fit", "fts", "fz"])
         if file:
-            st.session_state.file_bytes = file.getvalue()
+            set_source(file.getvalue(), file.name)
+        else:
+            set_source(None, None)
+    elif os.path.exists(EXAMPLE_PATH):
+        with open(EXAMPLE_PATH, "rb") as f:
+            set_source(f.read(), os.path.basename(EXAMPLE_PATH))
     else:
-        example_path = "resorces/jupiter_Miri.fits"
-        if os.path.exists(example_path):
-            with open(example_path, "rb") as f:
-                st.session_state.file_bytes = f.read()
+        st.error("Example file is missing.")
+        set_source(None, None)
 
+    D = DEFAULT_PARAMS
+    with st.expander("Processing Options", expanded=True):
+        log_scale = st.toggle("Logarithmic Scaling", value=D["log"], help="Applies log(1+x) scaling to enhance faint details.")
+        invert = st.toggle("Invert Values", value=D["invert"], help="Inverts the height map. For the model valleys become hills and vice versa")
+        clip = st.slider('Clipping %', 0.0, 5.0, D["clip"], step=0.1, help="Clips the lowest and highest percentile of pixels. Helps with hot pixels or saturated sources.")
+        sm = st.slider('Smoothing', 0.0, 5.0, D["smooth"], step=0.1, help="Applies Gaussian smoothing. A value of 1.0 to 2.0 is recommended for tactile models.")
+        ds = st.select_slider('Downsample Factor', options=[1, 2, 4, 8, 16], value=D["down"], help="Reduces image resolution by this factor. This helps to speed up processing as well as reduce the total storage size of the model.")
 
-    with st.form("settings_form"):
-        with st.expander("Processing Options", expanded=True):
-            log_scale = st.toggle("Logarithmic Scaling", value=st.session_state.params["log"], help="Applies log(1+x) scaling to enhance faint details.")
-            invert = st.toggle("Invert Values", value=st.session_state.params["invert"], help="Inverts the height map. For the model valleys become hills and vice versa")
-            clip = st.slider('Clipping %', 0.0, 5.0, st.session_state.params["clip"], help="Clips the lowest and highest percentile of pixels. Helps with hot pixels or saturated sources.", key="clip")
-            sm = st.slider('Smoothing', 0.0, 5.0, st.session_state.params["smooth"], help="Applies Gaussian smoothing. A value of 1.0 to 2.0 is recommended for tactile models.", key="smooth")
-            ds = st.select_slider('Downsample Factor', options=[1, 2, 4, 8, 16], value=st.session_state.params["down"], help="Reduces image resolution by this factor. This helps to speed up processing as well as reduce the total storage size of the model.", key="down")
+    with st.expander("Model Dimensions", expanded=False):
+        w = st.slider('Width (mm)', 10.0, 300.0, D["w"], help="Scales the image content so its longest side matches this value in mm. The final model will be larger if a border is added.")
+        z = st.slider('Relief Height (mm)', 1.0, 50.0, D["z"], help="Maximum height of the features above the base in mm.")
+        bt = st.slider('Base Thickness (mm)', 1.0, 10.0, D["base"], help="Thickness of the model's base in mm.")
 
-        with st.expander("Model Dimensions", expanded=False):
-            w = st.slider('Width (mm)', 10.0, 300.0, st.session_state.params["w"], help="Scales the image content so its longest side matches this value in mm. The final model will be larger if a border is added.", key="width")
-            z = st.slider('Relief Height (mm)', 1.0, 50.0, st.session_state.params["z"], help="Maximum height of the features above the base in mm.", key="height")
-            bt = st.slider('Base Thickness (mm)', 1.0, 10.0, st.session_state.params["base"], help="Thickness of the model's base in mm.")
+    with st.expander("Border Settings", expanded=False):
+        b_on = st.checkbox('Add Border', value=True)
+        bw = st.slider('Border Width (mm)', 0.1, 20.0, D["b_w"], help="Width of the border in mm.", disabled=not b_on)
+        bh = st.slider('Border Height (mm)', 0.0, 10.0, D["b_h"], help="Sets the height of the border, measured from the base in mm.", disabled=not b_on)
 
-        with st.expander("Border Settings", expanded=False):
-            b_on = st.checkbox('Add Border', value=True)
-            bw = st.slider('Border Width', 0.1, 20.0, st.session_state.params["b_w"], help="Width of border border in mm.")
-            bh = st.slider('Border Height', 0.0, 10.0, st.session_state.params["b_h"], help="Sets the height of the border, measured from the base in mm.")
+    params = {
+        "z": z, "w": w, "base": bt, "log": log_scale, "invert": invert,
+        "clip": clip, "smooth": sm, "down": ds,
+        "b_w": bw if b_on else 0.0, "b_h": bh if b_on else 0.0,
+    }
+    generate = st.button("🔨 Generate 3D Model", type="primary", disabled=st.session_state.file_bytes is None)
 
-
-        submitted = st.form_submit_button("🔨 Generate 3D Model", type="primary")
-        if submitted:
-            st.session_state.params = {
-                "z": z, "w": w, "base": bt, "log": log_scale, "invert": invert,
-                "clip": clip, "smooth": sm, "down": ds,
-                "b_w": bw if b_on else 0, "b_h": bh if b_on else 0
-            }
-            st.session_state.model_ready = True
+# --- GENERATE MODEL ---
+build_error = None
+if generate and st.session_state.file_bytes:
+    clear_model()
+    try:
+        with st.spinner("Constructing mesh..."):
+            fd, path = tempfile.mkstemp(suffix=".stl", prefix="astrotouch_")
+            os.close(fd)
+            st.session_state.stl_path = path
+            create_stl_from_fits(st.session_state.file_bytes, path, params)
+            st.session_state.stl_size = os.path.getsize(path)
+            st.session_state.stl_params = dict(params)
+        st.toast("3D model created! Open the Model View tab.", icon="✅")
+    except Exception as e:
+        clear_model()
+        build_error = f"Could not build the model: {e}"
 
 # --- MAIN PAGE ---
 tab1, tab2, tab3 = st.tabs(["Fits Preview", "Model View", "About"])
 
-if st.session_state.file_bytes:
-    with tab1:
-        col_img, col_metrics = st.columns([3, 1])
-        with col_img:
-            with st.spinner("Analyzing FITS Data..."):
-                with fits.open(io.BytesIO(st.session_state.file_bytes)) as h:
-                    img_raw = next(hdu.data for hdu in h if hdu.data is not None)
-                    if img_raw.ndim > 2: img_raw = img_raw[0]
-                    img = np.nan_to_num(img_raw)
-
-                p_low, p_high = np.percentile(img, [1, 99])
-                prev = np.clip(img, p_low, p_high)
-
-                # Dynamic visual preview based on logic toggles
-                if st.session_state.params["invert"]: prev = np.max(prev) - prev
-                if st.session_state.params["log"]: prev = np.log1p(prev - np.min(prev))
-
+with tab1:
+    if st.session_state.file_bytes is None:
+        st.info("Upload a FITS file in the sidebar to get started.")
+    else:
+        try:
+            img = load_fits(st.session_state.file_bytes)
+        except Exception as e:
+            st.error(f"Could not read this FITS file: {e}")
+            img = None
+        if img is not None:
+            col_img, col_metrics = st.columns([3, 1])
+            with col_img:
+                prev = make_preview(st.session_state.file_bytes, clip, log_scale, invert)
                 fig = px.imshow(prev, color_continuous_scale="viridis", origin='lower')
-                fig.update_layout(dragmode='pan', margin=dict(l=0, r=0, b=0, t=0))
-                st.plotly_chart(fig, use_container_width=True, config={'scrollZoom': True})
+                fig.update_layout(dragmode='pan', margin=dict(l=0, r=0, b=0, t=0), coloraxis_showscale=False)
+                st.plotly_chart(fig, width="stretch", config={'scrollZoom': True})
 
-        with col_metrics:
-            st.subheader("Fits Info")
-            st.metric("Native Resolution", f"{img.shape[1]}x{img.shape[0]}")
-            st.metric("Mesh Density",
-                      f"~{(img.shape[0] // st.session_state.params['down']) * (img.shape[1] // st.session_state.params['down'])} pts")
-            st.info("Log scaling is recommended for nebulae and galaxies to make faint gas clouds tactile.")
+            with col_metrics:
+                st.subheader("Fits Info")
+                st.metric("Native Resolution", f"{img.shape[1]}x{img.shape[0]}")
+                gy, gx = grid_shape(img.shape, params)
+                st.metric("Mesh Density", f"~{gx * gy:,} pts")
+                if gx * gy > MAX_GRID_POINTS:
+                    st.warning("Too many points: increase the downsample factor.")
+                st.info("Log scaling is recommended for nebulae and galaxies to make faint gas clouds tactile.")
 
-    with tab2:
-        if st.session_state.model_ready:
-            status = st.status("Constructing Mesh...", expanded=True)
-            status.write("Calculating normals and vertex heights...")
-            create_stl_from_fits(io.BytesIO(st.session_state.file_bytes), TEMP_STL_PATH, st.session_state.params)
-            status.write("Generating side walls and base...")
-            time.sleep(1)  # Visual pause for UX
-            status.update(label="3D Model Created!", state="complete", expanded=False)
+with tab2:
+    if build_error:
+        st.error(build_error)
+    elif st.session_state.stl_path and os.path.exists(st.session_state.stl_path):
+        c1, c2 = st.columns([2, 1])
+        with c1:
+            stl_from_file(file_path=st.session_state.stl_path, auto_rotate=True, key="stl_viewer")
+        with c2:
+            st.subheader("Ready for Printing")
+            st.markdown("""
+**1.** Use **Log Scaling**. In many FITS images, stars are bright but galaxies are faint. Log scaling lifts the "tactile floor" so the faint structures aren't lost in the baseplate.
 
-            c1, c2 = st.columns([2, 1])
-            with c1:
-                stl_from_file(file_path=TEMP_STL_PATH, auto_rotate=True)
-            with c2:
-                st.subheader("Ready for Printing")
-                st.markdown("""
-                                <div class="accessibility-box">
-                                <b>1.</b> Use <b>Log Scaling</b>. In many FITS images, stars are bright but galaxies are faint. Log scaling lifts the "tactile floor" so the faint structures aren't lost in the baseplate.
-                                <br><br>
-                                <b>2.</b> Keep <b>Smoothing</b> above 1.5. High-frequency digital noise feels like grit to the fingers. A smoother surface allows the user to feel the overall shape of the object.
-                                <br><br>
-                                <b>3.</b> A 10-15mm relief height is usually the "sweet spot" for tactile exploration. Any higher can make vertical walls sharp or fragile.
-                                <br><br>
-                                </div>
-                                """, unsafe_allow_html=True)
-                with open(TEMP_STL_PATH, "rb") as f:
-                    st.download_button("Download STL File", f, "astro_model.stl", type="primary")
-                st.caption("Recommended: 0.15mm - 0.2mm layer height.")
-        else:
-            st.info("Click 'Generate 3D Model' in the sidebar to build the mesh.")
+**2.** Keep **Smoothing** above 1.5. High-frequency digital noise feels like grit to the fingers. A smoother surface allows the user to feel the overall shape of the object.
+
+**3.** A 10-15mm relief height is usually the "sweet spot" for tactile exploration. Any higher can make vertical walls sharp or fragile.
+""")
+            with open(st.session_state.stl_path, "rb") as f:
+                stl_bytes = f.read()
+            base_name = os.path.splitext(st.session_state.get("file_name") or "astro")[0]
+            st.download_button("Download STL File", stl_bytes, f"{base_name}_astrotouch.stl",
+                               mime="model/stl", type="primary")
+            st.caption(f"File size: {st.session_state.stl_size / 1e6:.1f} MB. Recommended: 0.15mm - 0.2mm layer height.")
+    else:
+        st.info("Click 'Generate 3D Model' in the sidebar to build the mesh.")
 
 with tab3:
     st.title("About AstroTouch")

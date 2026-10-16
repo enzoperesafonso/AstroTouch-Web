@@ -37,7 +37,7 @@ Follow these instructions to set up and run a local instance of AstroTouch.
 1.  **Clone the repository:**
     ```bash
     git clone https://github.com/enzoperesafonso/AstroTouch-Web
-    cd AstroTouch
+    cd AstroTouch-Web
     ```
 
 2.  **Create and activate a virtual environment:**
@@ -62,7 +62,7 @@ Follow these instructions to set up and run a local instance of AstroTouch.
 Once the dependencies are installed, you can launch the application with a single command:
 
 ```bash
-streamlit run astrotouch.py
+streamlit run streamlit_app.py
 ```
 
 Your web browser should automatically open to the AstroTouch application.
