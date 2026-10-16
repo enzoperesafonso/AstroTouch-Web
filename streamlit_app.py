@@ -354,6 +354,10 @@ with tab3:
         3.  **Mesh Generation**: The processed array is converted into a 3D manifold (STL), 
             connecting thousands of triangles into a watertight surface suitable for 3D printing.
 
+        ### Looking for More Features?
+        This web app is a lightweight version of AstroTouch. The more feature-rich version is the
+        **[AstroTouch CLI](https://github.com/enzoperesafonso/AstroTouch)**, which is the recommended choice for advanced options and larger files.
+
         ### Open Source & Contribution
         AstroTouch is an ongoing effort to bridge the gap between science and accessibility. 
         To see the code behind this tool, report issues, or contribute to its development, please visit the **[GitHub repository](https://github.com/enzoperesafonso/AstroTouch-Web)**.

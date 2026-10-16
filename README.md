@@ -12,6 +12,8 @@
 
 ![AstroTouch Screenshot](resorces/screenshot.png)
 
+> **Note:** This is the lightweight web version of AstroTouch. The more feature-rich, actively developed version is the [command-line (CLI) tool](https://github.com/enzoperesafonso/AstroTouch). Use it for advanced options and larger files.
+
 ## Key Features
 
 - **FITS File Support**: Upload your own `.fits` or `.fz` files or use the built-in example.
